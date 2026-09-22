@@ -63,7 +63,63 @@ def build_chain() -> Any:
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+    from pydantic import BaseModel, Field
+    import os
+
+    llm = ChatDeepSeek(model="deepseek-v4-flash-vision-exp", api_key=os.getenv("DEEPSEEK_API_KEY"))
+
+    class Receipt(BaseModel):
+        original_prices: list[float] = Field(
+            description=(
+                "Positive item line amounts only. Use the dollar amount printed on each item line. "
+                "If 數量 is shown and the line already has a total, do not multiply by the quantity. "
+                "Exclude every discount, ROUNDING, 小計, OCTOPUS, 找續, 餘額, points, and card numbers."
+            )
+        )
+        discounts: list[float] = Field(
+            default_factory=list,
+            description=(
+                "One positive number per discount line: promotion, coupon, member, app, "
+                "packaging damage, Buy-X-Save, and percentage off. "
+                "A discount that covers several items is still one number. Do not include ROUNDING."
+            ),
+        )
+        rounding: float = Field(
+            default=0.0,
+            description="The ROUNDING line exactly as printed, usually negative. Use 0 if that line is absent.",
+        )
+        paid: float = Field(
+            description="The final amount paid after rounding: the OCTOPUS line, also shown as 扣除金額. Not 小計 and not 餘額.",
+        )
+
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Return a JSON object for this one supermarket receipt. "
+            "Keys: original_prices (array of numbers), discounts (array of numbers), rounding (number), paid (number). "
+            "original_prices: positive item line amounts only. Use the dollar amount printed on each item line. "
+            "If 數量 is shown and the line already has a total, do not multiply by the quantity. "
+            "Exclude every discount, ROUNDING, 小計, OCTOPUS, 找續, 餘額, points, and card numbers. "
+            "discounts: one positive number per discount line (promotion, coupon, member, app, packaging damage, Buy-X-Save, percentage off). "
+            "A discount that covers several items is still one number. Do not include ROUNDING. "
+            "rounding: the ROUNDING line exactly as printed, usually negative. Use 0 if that line is absent. "
+            "paid: the final amount paid after rounding, the OCTOPUS line, also shown as 扣除金額. Not 小計 and not 餘額. "
+            "Labels may be Chinese or English. Copy printed amounts only. Do not add or subtract.",
+        ),
+        (
+            "human",
+            [
+                {"type": "text", "text": "Extract this receipt."},
+                {"type": "image_url", "image_url": {"url": "{image_url}"}},
+            ],
+        ),
+    ])
+
+    chain = prompt | llm.with_structured_output(Receipt, method="json_mode")
+
+    return chain
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -79,8 +135,44 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    def parts(receipt: Any) -> tuple[Decimal, Decimal, bool]:
+        prices = [Decimal(str(price)) for price in receipt.original_prices]
+        discounts = [Decimal(str(amount)) for amount in receipt.discounts]
+        rounding = Decimal(str(receipt.rounding))
+        paid = Decimal(str(receipt.paid))
+        price_sum = sum(prices, Decimal("0.00"))
+        discount_sum = sum(discounts, Decimal("0.00"))
+        rebuilt = price_sum - discount_sum + rounding
+        return paid, price_sum, rebuilt == paid
+
+    pending = list(images)
+    chosen: dict[Path, tuple[Decimal, Decimal]] = {}
+    for attempt in range(0, 3):
+        if not pending:
+            break
+        receipts = chain.batch(
+            [{"image_url": image_data_url(path)} for path in pending]
+        )
+        failed: list[Path] = []
+        for path, receipt in zip(pending, receipts):
+            paid, price_sum, matched = parts(receipt)
+            print(f"try {attempt + 1} {path.name}: paid={paid} prices={price_sum} match={matched}")
+            chosen[path] = (paid, price_sum)
+            if not matched:
+                failed.append(path)
+        pending = failed
+
+    spent = Decimal("0.00")
+    without_discount = Decimal("0.00")
+    for path in images:
+        paid, price_sum = chosen[path]
+        spent += paid
+        without_discount += price_sum
+
+    return {
+        QUERY_1: f"HK${spent:.2f}",
+        QUERY_2: f"HK${without_discount:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

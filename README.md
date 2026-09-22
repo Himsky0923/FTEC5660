@@ -49,5 +49,7 @@ homework runner.
 
 
 ## Homework 1 solution: 
-> to students: please fill your solution description here.
+To answer the queries, we first need to know the total discount, rounding, and total original price for each recipt. As a result, we can utlize the LLM to extarct the desired information into a defined structure, namely Recipt, which is a pydantic model, to ensure the output format stay consistent through structured output.
+
+And then we calculate the results for queries with just python code using the data that we extarcted by the LLM. Before that, a retry loop is implemented to prevent incorrect data extarction due to the noise of LLM by checking (total original prices - total discounts + rounding) == paid price for each recipt. If any of these recipts fails, we will run those failed recipt(s) again in batch with maximum of 3 tries.
 
