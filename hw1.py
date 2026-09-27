@@ -64,62 +64,106 @@ def build_chain() -> Any:
     """
     ### YOUR CODE HERE
     from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.runnables import RunnableParallel
     from langchain_deepseek import ChatDeepSeek
     from pydantic import BaseModel, Field
     import os
 
     llm = ChatDeepSeek(model="deepseek-v4-flash-vision-exp", api_key=os.getenv("DEEPSEEK_API_KEY"))
 
-    class Receipt(BaseModel):
+    class Items(BaseModel):
         original_prices: list[float] = Field(
             description=(
-                "Positive item line amounts only. Use the dollar amount printed on each item line. "
-                "If 數量 is shown and the line already has a total, do not multiply by the quantity. "
-                "Exclude every discount, ROUNDING, 小計, OCTOPUS, 找續, 餘額, points, and card numbers."
+                "One number per item line, including a $0.00 item line such as COUPON or VCODE. "
+                "Use the dollar amount printed on the right of that line. "
+                "If QTY or 數量 is shown and the line already has a total, do not multiply. "
+                "Exclude discount lines, ROUNDING, 小計, SUBTOTAL, the payment line, 找續, CHANGE, 餘額, points, and card numbers."
+            )
+        )
+        quantities: list[int] = Field(
+            description=(
+                "Same length and order as original_prices. "
+                "The QTY or 數量 printed on that item line. Use 1 when that line has no quantity."
             )
         )
         discounts: list[float] = Field(
             default_factory=list,
             description=(
-                "One positive number per discount line: promotion, coupon, member, app, "
+                "One positive number per discount line: promotion, coupon amount, member, app, "
                 "packaging damage, Buy-X-Save, and percentage off. "
-                "A discount that covers several items is still one number. Do not include ROUNDING."
+                "A discount that covers several items is still one number. "
+                "Do not include a $0.00 item line. Do not include ROUNDING."
             ),
+        )
+
+    class Footer(BaseModel):
+        item_count: int = Field(
+            description="The integer printed on the left of 小計 or SUBTOTAL. Copy that integer. Do not count rows."
+        )
+        subtotal: float = Field(
+            description="The amount printed on the 小計 or SUBTOTAL line. Copy it. Do not calculate it."
         )
         rounding: float = Field(
             default=0.0,
             description="The ROUNDING line exactly as printed, usually negative. Use 0 if that line is absent.",
         )
         paid: float = Field(
-            description="The final amount paid after rounding: the OCTOPUS line, also shown as 扣除金額. Not 小計 and not 餘額.",
+            description=(
+                "The amount on the payment line directly under ROUNDING, such as OCTOPUS or VISA, after rounding. "
+                "Not 小計, not SUBTOTAL, not CHANGE, not 找續, not 餘額."
+            )
         )
 
-    prompt = ChatPromptTemplate.from_messages([
+    items_prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "Return a JSON object for this one supermarket receipt. "
-            "Keys: original_prices (array of numbers), discounts (array of numbers), rounding (number), paid (number). "
-            "original_prices: positive item line amounts only. Use the dollar amount printed on each item line. "
-            "If 數量 is shown and the line already has a total, do not multiply by the quantity. "
-            "Exclude every discount, ROUNDING, 小計, OCTOPUS, 找續, 餘額, points, and card numbers. "
-            "discounts: one positive number per discount line (promotion, coupon, member, app, packaging damage, Buy-X-Save, percentage off). "
-            "A discount that covers several items is still one number. Do not include ROUNDING. "
-            "rounding: the ROUNDING line exactly as printed, usually negative. Use 0 if that line is absent. "
-            "paid: the final amount paid after rounding, the OCTOPUS line, also shown as 扣除金額. Not 小計 and not 餘額. "
+            "Return JSON for the item and discount lines of this one supermarket receipt. "
+            "Keys: original_prices (array of numbers), quantities (array of integers), discounts (array of numbers). "
+            "original_prices: one number per item line, including a $0.00 item line such as COUPON or VCODE. "
+            "Use the dollar amount printed on the right of that line. "
+            "If QTY or 數量 is shown and the line already has a total, do not multiply. "
+            "Exclude discount lines, ROUNDING, 小計, SUBTOTAL, the payment line, 找續, CHANGE, 餘額, points, and card numbers. "
+            "quantities: same length and order as original_prices. "
+            "Use the QTY or 數量 on that item line, or 1 when it is not printed. "
+            "discounts: one positive number per discount line "
+            "(promotion, coupon amount, member, app, packaging damage, Buy-X-Save, percentage off). "
+            "A discount that covers several items is still one number. "
+            "Do not include a $0.00 item line. Do not include ROUNDING. "
             "Labels may be Chinese or English. Copy printed amounts only. Do not add or subtract.",
         ),
         (
             "human",
             [
-                {"type": "text", "text": "Extract this receipt."},
+                {"type": "text", "text": "Extract the item lines and the discount lines."},
                 {"type": "image_url", "image_url": {"url": "{image_url}"}},
             ],
         ),
     ])
 
-    chain = prompt | llm.with_structured_output(Receipt, method="json_mode")
+    footer_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Return JSON for the totals block of this one supermarket receipt. "
+            "Keys: item_count (integer), subtotal (number), rounding (number), paid (number). "
+            "Copy the printed totals. Do not list items and do not calculate. "
+            "item_count: the integer on the left of 小計 or SUBTOTAL. "
+            "subtotal: the amount on the 小計 or SUBTOTAL line. "
+            "rounding: the ROUNDING line exactly as printed, usually negative. Use 0 if that line is absent. "
+            "paid: the amount on the payment line directly under ROUNDING, such as OCTOPUS or VISA. "
+            "Not 小計, not SUBTOTAL, not CHANGE, not 找續, not 餘額.",
+        ),
+        (
+            "human",
+            [
+                {"type": "text", "text": "Read the totals block only."},
+                {"type": "image_url", "image_url": {"url": "{image_url}"}},
+            ],
+        ),
+    ])
 
-    return chain
+    items_chain = items_prompt | llm.with_structured_output(Items, method="json_mode")
+    footer_chain = footer_prompt | llm.with_structured_output(Footer, method="json_mode")
+    return RunnableParallel(items=items_chain, footer=footer_chain)
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -135,27 +179,43 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    def parts(receipt: Any) -> tuple[Decimal, Decimal, bool]:
-        prices = [Decimal(str(price)) for price in receipt.original_prices]
-        discounts = [Decimal(str(amount)) for amount in receipt.discounts]
-        rounding = Decimal(str(receipt.rounding))
-        paid = Decimal(str(receipt.paid))
+    def money(value: Any) -> Decimal:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+
+    def parts(result: Any) -> tuple[Decimal, Decimal, bool]:
+        items = result["items"]
+        footer = result["footer"]
+        prices = [money(price) for price in items.original_prices]
+        quantities = [int(qty) for qty in items.quantities]
+        discounts = [money(amount) for amount in items.discounts]
+        subtotal = money(footer.subtotal)
+        rounding = money(footer.rounding)
+        paid = money(footer.paid)
         price_sum = sum(prices, Decimal("0.00"))
         discount_sum = sum(discounts, Decimal("0.00"))
-        rebuilt = price_sum - discount_sum + rounding
-        return paid, price_sum, rebuilt == paid
+        # The dollar identity alone can pass when an item and a discount of the
+        # same amount are both missing. The printed unit count catches that.
+        # Subtotal and paid are read in a separate call, so the item call cannot
+        # edit them to force a match.
+        matched = (
+            len(prices) == len(quantities)
+            and sum(quantities) == int(footer.item_count)
+            and price_sum - discount_sum == subtotal
+            and subtotal + rounding == paid
+        )
+        return paid, price_sum, matched
 
     pending = list(images)
     chosen: dict[Path, tuple[Decimal, Decimal]] = {}
     for attempt in range(0, 3):
         if not pending:
             break
-        receipts = chain.batch(
+        results = chain.batch(
             [{"image_url": image_data_url(path)} for path in pending]
         )
         failed: list[Path] = []
-        for path, receipt in zip(pending, receipts):
-            paid, price_sum, matched = parts(receipt)
+        for path, result in zip(pending, results):
+            paid, price_sum, matched = parts(result)
             print(f"try {attempt + 1} {path.name}: paid={paid} prices={price_sum} match={matched}")
             chosen[path] = (paid, price_sum)
             if not matched:
